@@ -1,0 +1,285 @@
+
+name: Build OnePlus 7 Kernel with KSU + Kprobes
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernelsu_version:
+        description: 'KernelSU version (leave empty for existing)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Maximize build space
+      uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb: 8192
+        swap-size-mb: 8192
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+        remove-codeql: 'true'
+        
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          git bc bison build-essential ccache curl flex \
+          g++-multilib gcc-multilib git gnupg gperf \
+          lib32ncurses5-dev lib32z1-dev libelf-dev \
+          liblz4-tool libncurses5-dev libsdl1.2-dev \
+          libssl-dev libxml2 libxml2-utils lzop \
+          pngcrush rsync schedtool squashfs-tools xsltproc \
+          zip zlib1g-dev python3 python-is-python3 \
+          libarchive-tools cpio
+          
+    - name: Clone kernel source
+      run: |
+        git clone --depth=1 -b 16-c https://github.com/QuinceROMs/android_kernel_oneplus_sm8150.git kernel
+        cd kernel
+        echo "Kernel cloned successfully"
+        
+    - name: Setup Clang toolchain
+      run: |
+        mkdir -p toolchain
+        cd toolchain
+        # Use Neutron Clang (popular for 4.14 kernels)
+        curl -LO "https://raw.githubusercontent.com/nicoleellaaa/nicoleellaaa.github.io/main/files/neutron-clang-20250328.tar.zst"
+        tar -I zstd -xf neutron-clang-20250328.tar.zst
+        rm neutron-clang-20250328.tar.zst
+        
+    - name: Fix KernelSU integration in Makefile
+      run: |
+        cd kernel
+        
+        # Check if KernelSU line already exists
+        if ! grep -q "kernelsu" drivers/Makefile; then
+          echo "Adding KernelSU to drivers/Makefile..."
+          # Add KernelSU to drivers/Makefile before the last line
+          sed -i '/obj-\$(CONFIG_SENSORS_SSC)/a obj-\$(CONFIG_KSU)\t\t\t+= kernelsu/' drivers/Makefile
+        else
+          echo "KernelSU already in drivers/Makefile"
+        fi
+        
+        # Verify the change
+        echo "=== drivers/Makefile KernelSU line ==="
+        grep -n "kernelsu" drivers/Makefile || echo "WARNING: KernelSU not found!"
+        
+    - name: Fix KernelSU integration in Kconfig
+      run: |
+        cd kernel
+        
+        # Check if KernelSU Kconfig is sourced
+        if ! grep -q "kernelsu/Kconfig" drivers/Kconfig; then
+          echo "Adding KernelSU to drivers/Kconfig..."
+          # Add before endmenu
+          sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+        else
+          echo "KernelSU already in drivers/Kconfig"
+        fi
+        
+        # Verify
+        echo "=== drivers/Kconfig KernelSU line ==="
+        grep -n "kernelsu" drivers/Kconfig || echo "WARNING: KernelSU Kconfig not found!"
+
+    - name: Enable Kprobes and KSU in defconfig
+      run: |
+        cd kernel
+        DEFCONFIG="arch/arm64/configs/vendor/sm8150-perf_defconfig"
+        
+        echo "=== Adding Kprobes support ==="
+        
+        # Remove any existing kprobe-related configs (to avoid duplicates)
+        sed -i '/CONFIG_KPROBES/d' $DEFCONFIG
+        sed -i '/CONFIG_KRETPROBES/d' $DEFCONFIG
+        sed -i '/CONFIG_KPROBE_EVENTS/d' $DEFCONFIG
+        sed -i '/CONFIG_FTRACE_SYSCALLS/d' $DEFCONFIG
+        
+        # Add Kprobes configs (required for APatch and KSU KPM)
+        echo "" >> $DEFCONFIG
+        echo "# Kprobes support for APatch and KernelSU KPM" >> $DEFCONFIG
+        echo "CONFIG_KPROBES=y" >> $DEFCONFIG
+        echo "CONFIG_KRETPROBES=y" >> $DEFCONFIG
+        echo "CONFIG_KPROBE_EVENTS=y" >> $DEFCONFIG
+        echo "CONFIG_FTRACE_SYSCALLS=y" >> $DEFCONFIG
+        
+        echo "=== Adding KernelSU configs ==="
+        
+        # Remove existing KSU configs
+        sed -i '/CONFIG_KSU/d' $DEFCONFIG
+        
+        # Add KSU with kprobes hook (not manual hook)
+        echo "" >> $DEFCONFIG
+        echo "# KernelSU with Kprobes hook for KPM support" >> $DEFCONFIG
+        echo "CONFIG_KSU=y" >> $DEFCONFIG
+        echo "# CONFIG_KSU_DEBUG is not set" >> $DEFCONFIG
+        echo "# CONFIG_KSU_MANUAL_HOOK is not set" >> $DEFCONFIG
+        echo "CONFIG_KSU_KPROBES_HOOK=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> $DEFCONFIG
+        
+        echo "=== Verifying defconfig changes ==="
+        echo "--- Kprobes configs ---"
+        grep "KPROBE" $DEFCONFIG
+        echo "--- KSU configs ---"
+        grep "KSU" $DEFCONFIG
+        
+    - name: Build kernel
+      run: |
+        cd kernel
+        
+        export PATH="$GITHUB_WORKSPACE/toolchain/bin:$PATH"
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+        export CC=clang
+        export CLANG_TRIPLE=aarch64-linux-gnu-
+        
+        # Additional clang flags
+        export KBUILD_COMPILER_STRING="$(clang --version | head -n 1)"
+        echo "Compiler: $KBUILD_COMPILER_STRING"
+        
+        # Clean
+        make O=out clean
+        make O=out mrproper
+        
+        # Generate defconfig
+        make O=out ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+          vendor/sm8150-perf_defconfig vendor/oplus.config
+          
+        # Show key configs
+        echo "=== Verifying .config ==="
+        grep -E "CONFIG_KPROBES|CONFIG_KSU|CONFIG_KALLSYMS" out/.config | head -20
+        
+        # Build
+        make O=out ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          -j$(nproc --all) 2>&1 | tee build.log
+          
+    - name: Check build result
+      run: |
+        cd kernel
+        if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
+          echo "✅ Kernel built successfully!"
+          ls -la out/arch/arm64/boot/Image.gz-dtb
+        elif [ -f out/arch/arm64/boot/Image.gz ]; then
+          echo "✅ Kernel Image.gz built!"
+          ls -la out/arch/arm64/boot/Image.gz
+        elif [ -f out/arch/arm64/boot/Image ]; then
+          echo "✅ Kernel Image built!"
+          ls -la out/arch/arm64/boot/Image
+        else
+          echo "❌ Kernel build failed!"
+          echo "=== Last 100 lines of build log ==="
+          tail -100 build.log
+          exit 1
+        fi
+        
+    - name: Create boot.img
+      run: |
+        cd kernel
+        
+        # Clone AnyKernel3
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel
+        
+        # Setup AnyKernel3 for OnePlus 7
+        cd anykernel
+        
+        # Clean unnecessary files
+        rm -rf .git .github modules patch ramdisk
+        
+        # Configure for guacamoleb
+        cat > anykernel.sh << 'AKEOF'
+# AnyKernel3 Ramdisk Mod Script
+# osm0sis @ xda-developers
+
+properties() { '
+kernel.string=OnePlus7-KSU-Kprobes-Kernel
+do.devicecheck=1
+do.modules=0
+do.systemless=1
+do.cleanup=1
+do.cleanuponabort=0
+device.name1=OnePlus7
+device.name2=guacamoleb
+device.name3=OnePlus 7
+device.name4=GM1900
+device.name5=GM1901
+device.name6=GM1903
+device.name7=GM1905
+supported.versions=
+supported.patchlevels=
+'; }
+
+block=/dev/block/bootdevice/by-name/boot;
+is_slot_device=auto;
+ramdisk_compression=auto;
+patch_vbmeta_flag=auto;
+
+. tools/ak3-core.sh;
+
+set_perm_recursive 0 0 755 644 $ramdisk/*;
+set_perm_recursive 0 0 750 750 $ramdisk/init* $ramdisk/sbin;
+
+dump_boot;
+write_boot;
+AKEOF
+
+        # Copy kernel image
+        if [ -f ../out/arch/arm64/boot/Image.gz-dtb ]; then
+          cp ../out/arch/arm64/boot/Image.gz-dtb Image.gz-dtb
+        elif [ -f ../out/arch/arm64/boot/Image.gz ]; then
+          cp ../out/arch/arm64/boot/Image.gz Image.gz
+        elif [ -f ../out/arch/arm64/boot/Image ]; then
+          cp ../out/arch/arm64/boot/Image Image
+        fi
+        
+        # Copy DTB if separate
+        if [ -f ../out/arch/arm64/boot/dtb.img ]; then
+          cp ../out/arch/arm64/boot/dtb.img dtb
+        fi
+        if [ -f ../out/arch/arm64/boot/dtbo.img ]; then
+          cp ../out/arch/arm64/boot/dtbo.img dtbo.img
+        fi
+        
+        # Create flashable zip
+        zip -r9 ../OnePlus7-KSU-Kprobes-Kernel-$(date +%Y%m%d).zip * -x '*.git*'
+        
+        echo "✅ Flashable zip created!"
+        ls -la ../OnePlus7-KSU-Kprobes-Kernel-*.zip
+        
+    - name: Upload kernel zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: OnePlus7-KSU-Kprobes-Kernel
+        path: kernel/OnePlus7-KSU-Kprobes-Kernel-*.zip
+        
+    - name: Upload build log
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: build-log
+        path: kernel/build.log
