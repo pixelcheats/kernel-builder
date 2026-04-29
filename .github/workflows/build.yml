@@ -1,13 +1,20 @@
-
 name: Build OnePlus 7 Kernel with KSU + Kprobes
 
 on:
   workflow_dispatch:
     inputs:
       kernelsu_version:
-        description: 'KernelSU version (leave empty for existing)'
+        description: 'KernelSU version tag (e.g., v0.9.5, leave empty for latest)'
         required: false
         default: ''
+      use_susfs:
+        description: 'Use SUSFS fork of KernelSU'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 jobs:
   build:
@@ -35,34 +42,98 @@ jobs:
           libssl-dev libxml2 libxml2-utils lzop \
           pngcrush rsync schedtool squashfs-tools xsltproc \
           zip zlib1g-dev python3 python-is-python3 \
-          libarchive-tools cpio
+          libarchive-tools cpio zstd
           
     - name: Clone kernel source
       run: |
         git clone --depth=1 -b 16-c https://github.com/QuinceROMs/android_kernel_oneplus_sm8150.git kernel
         cd kernel
         echo "Kernel cloned successfully"
+        ls -la
         
     - name: Setup Clang toolchain
       run: |
         mkdir -p toolchain
         cd toolchain
-        # Use Neutron Clang (popular for 4.14 kernels)
+        
+        # Download Neutron Clang
         curl -LO "https://raw.githubusercontent.com/nicoleellaaa/nicoleellaaa.github.io/main/files/neutron-clang-20250328.tar.zst"
         tar -I zstd -xf neutron-clang-20250328.tar.zst
         rm neutron-clang-20250328.tar.zst
+        
+        # Find and display the actual bin directory
+        echo "=== Toolchain contents ==="
+        ls -la
+        
+        # Find clang binary location
+        CLANG_PATH=$(find . -name "clang" -type f -executable | head -1)
+        if [ -n "$CLANG_PATH" ]; then
+          CLANG_DIR=$(dirname "$CLANG_PATH")
+          echo "TOOLCHAIN_BIN=$(cd "$CLANG_DIR" && pwd)" >> $GITHUB_ENV
+          echo "Found clang at: $CLANG_DIR"
+        else
+          # Fallback: assume standard structure
+          echo "TOOLCHAIN_BIN=$GITHUB_WORKSPACE/toolchain/bin" >> $GITHUB_ENV
+        fi
+        
+    - name: Setup KernelSU
+      run: |
+        cd kernel
+        
+        KSU_VERSION="${{ github.event.inputs.kernelsu_version }}"
+        USE_SUSFS="${{ github.event.inputs.use_susfs }}"
+        
+        if [ "$USE_SUSFS" = "true" ]; then
+          echo "=== Setting up KernelSU with SUSFS ==="
+          # Clone SUSFS fork
+          git clone --depth=1 https://github.com/sidex15/KernelSU-SUSFS drivers/kernelsu
+          cd drivers/kernelsu
+          # Checkout specific version if specified
+          if [ -n "$KSU_VERSION" ]; then
+            git fetch --depth=1 origin tag "$KSU_VERSION"
+            git checkout "$KSU_VERSION"
+          fi
+          cd ../..
+        else
+          echo "=== Setting up official KernelSU ==="
+          # Use official setup script
+          if [ -n "$KSU_VERSION" ]; then
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "$KSU_VERSION"
+          else
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          fi
+        fi
+        
+        # Verify KernelSU was set up
+        echo "=== Verifying KernelSU setup ==="
+        if [ -d "drivers/kernelsu" ]; then
+          echo "✅ KernelSU directory exists"
+          ls -la drivers/kernelsu/
+        else
+          echo "❌ KernelSU directory not found!"
+          exit 1
+        fi
+        
+        # Check if Kconfig exists
+        if [ -f "drivers/kernelsu/Kconfig" ]; then
+          echo "✅ KernelSU Kconfig found"
+          cat drivers/kernelsu/Kconfig
+        else
+          echo "❌ KernelSU Kconfig not found!"
+          exit 1
+        fi
         
     - name: Fix KernelSU integration in Makefile
       run: |
         cd kernel
         
-        # Check if KernelSU line already exists
+        # Check if KernelSU line already exists (setup.sh may have added it)
         if ! grep -q "kernelsu" drivers/Makefile; then
           echo "Adding KernelSU to drivers/Makefile..."
-          # Add KernelSU to drivers/Makefile before the last line
-          sed -i '/obj-\$(CONFIG_SENSORS_SSC)/a obj-\$(CONFIG_KSU)\t\t\t+= kernelsu/' drivers/Makefile
+          # Add KernelSU to drivers/Makefile
+          echo 'obj-$(CONFIG_KSU)		+= kernelsu/' >> drivers/Makefile
         else
-          echo "KernelSU already in drivers/Makefile"
+          echo "✅ KernelSU already in drivers/Makefile"
         fi
         
         # Verify the change
@@ -73,13 +144,13 @@ jobs:
       run: |
         cd kernel
         
-        # Check if KernelSU Kconfig is sourced
+        # Check if KernelSU Kconfig is sourced (setup.sh may have added it)
         if ! grep -q "kernelsu/Kconfig" drivers/Kconfig; then
           echo "Adding KernelSU to drivers/Kconfig..."
           # Add before endmenu
           sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
         else
-          echo "KernelSU already in drivers/Kconfig"
+          echo "✅ KernelSU already in drivers/Kconfig"
         fi
         
         # Verify
@@ -91,90 +162,142 @@ jobs:
         cd kernel
         DEFCONFIG="arch/arm64/configs/vendor/sm8150-perf_defconfig"
         
+        # Check if defconfig exists
+        if [ ! -f "$DEFCONFIG" ]; then
+          echo "Primary defconfig not found, searching..."
+          find arch/arm64/configs -name "*sm8150*" -o -name "*guacamole*" | head -5
+          # Try alternative locations
+          if [ -f "arch/arm64/configs/sm8150-perf_defconfig" ]; then
+            DEFCONFIG="arch/arm64/configs/sm8150-perf_defconfig"
+          fi
+        fi
+        
+        echo "Using defconfig: $DEFCONFIG"
+        
         echo "=== Adding Kprobes support ==="
         
         # Remove any existing kprobe-related configs (to avoid duplicates)
         sed -i '/CONFIG_KPROBES/d' $DEFCONFIG
-        sed -i '/CONFIG_KRETPROBES/d' $DEFCONFIG
+        sed -i '/CONFIG_HAVE_KPROBES/d' $DEFCONFIG
         sed -i '/CONFIG_KPROBE_EVENTS/d' $DEFCONFIG
-        sed -i '/CONFIG_FTRACE_SYSCALLS/d' $DEFCONFIG
+        sed -i '/CONFIG_KPROBE_EVENT/d' $DEFCONFIG
         
-        # Add Kprobes configs (required for APatch and KSU KPM)
-        echo "" >> $DEFCONFIG
-        echo "# Kprobes support for APatch and KernelSU KPM" >> $DEFCONFIG
-        echo "CONFIG_KPROBES=y" >> $DEFCONFIG
-        echo "CONFIG_KRETPROBES=y" >> $DEFCONFIG
-        echo "CONFIG_KPROBE_EVENTS=y" >> $DEFCONFIG
-        echo "CONFIG_FTRACE_SYSCALLS=y" >> $DEFCONFIG
+        # Add Kprobes configs (required for KernelSU kprobe hooks)
+        cat >> $DEFCONFIG << 'EOF'
+
+# Kprobes support for KernelSU
+CONFIG_KPROBES=y
+CONFIG_HAVE_KPROBES=y
+CONFIG_KPROBE_EVENTS=y
+EOF
         
-        echo "=== Adding KernelSU configs ==="
+        echo "=== Adding KernelSU config ==="
         
         # Remove existing KSU configs
         sed -i '/CONFIG_KSU/d' $DEFCONFIG
         
-        # Add KSU with kprobes hook (not manual hook)
-        echo "" >> $DEFCONFIG
-        echo "# KernelSU with Kprobes hook for KPM support" >> $DEFCONFIG
-        echo "CONFIG_KSU=y" >> $DEFCONFIG
-        echo "# CONFIG_KSU_DEBUG is not set" >> $DEFCONFIG
-        echo "# CONFIG_KSU_MANUAL_HOOK is not set" >> $DEFCONFIG
-        echo "CONFIG_KSU_KPROBES_HOOK=y" >> $DEFCONFIG
-        echo "CONFIG_KSU_SUSFS=y" >> $DEFCONFIG
-        echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> $DEFCONFIG
-        echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> $DEFCONFIG
-        echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> $DEFCONFIG
-        echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> $DEFCONFIG
-        echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> $DEFCONFIG
-        echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> $DEFCONFIG
-        echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> $DEFCONFIG
-        echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> $DEFCONFIG
-        echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> $DEFCONFIG
-        echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> $DEFCONFIG
+        # Add KSU config - let Kconfig handle the rest
+        cat >> $DEFCONFIG << 'EOF'
+
+# KernelSU
+CONFIG_KSU=y
+EOF
+        
+        # Only add SUSFS configs if using SUSFS fork
+        if [ "${{ github.event.inputs.use_susfs }}" = "true" ]; then
+          cat >> $DEFCONFIG << 'EOF'
+CONFIG_KSU_SUSFS=y
+CONFIG_KSU_SUSFS_SUS_PATH=y
+CONFIG_KSU_SUSFS_SUS_MOUNT=y
+CONFIG_KSU_SUSFS_SUS_KSTAT=y
+CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+CONFIG_KSU_SUSFS_ENABLE_LOG=y
+CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+EOF
+        fi
         
         echo "=== Verifying defconfig changes ==="
         echo "--- Kprobes configs ---"
-        grep "KPROBE" $DEFCONFIG
+        grep -E "KPROBE|HAVE_KPROBE" $DEFCONFIG || echo "No KPROBE configs found"
         echo "--- KSU configs ---"
-        grep "KSU" $DEFCONFIG
+        grep "KSU" $DEFCONFIG || echo "No KSU configs found"
+        
+        # Save defconfig path for later use
+        echo "DEFCONFIG_PATH=$DEFCONFIG" >> $GITHUB_ENV
         
     - name: Build kernel
       run: |
         cd kernel
         
-        export PATH="$GITHUB_WORKSPACE/toolchain/bin:$PATH"
+        # Setup PATH with toolchain
+        export PATH="${TOOLCHAIN_BIN}:$PATH"
+        
+        # Verify clang works
+        echo "=== Checking Clang ==="
+        which clang || { echo "❌ Clang not found in PATH"; exit 1; }
+        clang --version
+        
         export ARCH=arm64
         export SUBARCH=arm64
-        export CROSS_COMPILE=aarch64-linux-gnu-
-        export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-        export CC=clang
-        export CLANG_TRIPLE=aarch64-linux-gnu-
         
-        # Additional clang flags
+        # Show compiler string
         export KBUILD_COMPILER_STRING="$(clang --version | head -n 1)"
         echo "Compiler: $KBUILD_COMPILER_STRING"
         
         # Clean
-        make O=out clean
-        make O=out mrproper
+        make O=out clean mrproper
         
-        # Generate defconfig
+        # Extract just the defconfig name from the path
+        DEFCONFIG_NAME=$(basename $DEFCONFIG_PATH)
+        DEFCONFIG_DIR=$(dirname $DEFCONFIG_PATH | sed 's|arch/arm64/configs/||')
+        
+        if [ "$DEFCONFIG_DIR" != "." ] && [ -n "$DEFCONFIG_DIR" ]; then
+          FULL_DEFCONFIG="${DEFCONFIG_DIR}/${DEFCONFIG_NAME}"
+        else
+          FULL_DEFCONFIG="${DEFCONFIG_NAME}"
+        fi
+        
+        echo "Using defconfig: $FULL_DEFCONFIG"
+        
+        # Generate defconfig (using LLVM toolchain)
         make O=out ARCH=arm64 \
           CC=clang \
-          CLANG_TRIPLE=aarch64-linux-gnu- \
-          CROSS_COMPILE=aarch64-linux-gnu- \
-          CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-          vendor/sm8150-perf_defconfig vendor/oplus.config
+          LD=ld.lld \
+          AR=llvm-ar \
+          NM=llvm-nm \
+          OBJCOPY=llvm-objcopy \
+          OBJDUMP=llvm-objdump \
+          STRIP=llvm-strip \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          $FULL_DEFCONFIG
+          
+        # Check if we need to merge another config
+        if [ -f "arch/arm64/configs/vendor/oplus.config" ]; then
+          echo "Merging oplus.config..."
+          scripts/kconfig/merge_config.sh -m out/.config arch/arm64/configs/vendor/oplus.config
+          make O=out ARCH=arm64 olddefconfig
+        fi
           
         # Show key configs
         echo "=== Verifying .config ==="
-        grep -E "CONFIG_KPROBES|CONFIG_KSU|CONFIG_KALLSYMS" out/.config | head -20
+        echo "--- Kprobes ---"
+        grep -E "CONFIG_KPROBES|CONFIG_HAVE_KPROBES|CONFIG_KPROBE_EVENTS" out/.config || echo "Kprobes not enabled!"
+        echo "--- KernelSU ---"
+        grep -E "CONFIG_KSU" out/.config || echo "KSU not enabled!"
+        echo "--- Kallsyms ---"
+        grep -E "CONFIG_KALLSYMS" out/.config || echo "Kallsyms not found"
         
-        # Build
+        # Build with full LLVM
         make O=out ARCH=arm64 \
           CC=clang \
-          CLANG_TRIPLE=aarch64-linux-gnu- \
-          CROSS_COMPILE=aarch64-linux-gnu- \
-          CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+          LD=ld.lld \
+          AR=llvm-ar \
+          NM=llvm-nm \
+          OBJCOPY=llvm-objcopy \
+          OBJDUMP=llvm-objdump \
+          STRIP=llvm-strip \
           LLVM=1 \
           LLVM_IAS=1 \
           -j$(nproc --all) 2>&1 | tee build.log
@@ -182,23 +305,42 @@ jobs:
     - name: Check build result
       run: |
         cd kernel
+        
+        echo "=== Searching for kernel images ==="
+        find out/arch/arm64/boot -type f \( -name "Image*" -o -name "*.dtb" -o -name "dtbo.img" \) 2>/dev/null | head -20
+        
         if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
-          echo "✅ Kernel built successfully!"
+          echo "✅ Kernel built successfully! (Image.gz-dtb)"
           ls -la out/arch/arm64/boot/Image.gz-dtb
+          KERNEL_IMAGE="Image.gz-dtb"
         elif [ -f out/arch/arm64/boot/Image.gz ]; then
           echo "✅ Kernel Image.gz built!"
           ls -la out/arch/arm64/boot/Image.gz
+          KERNEL_IMAGE="Image.gz"
         elif [ -f out/arch/arm64/boot/Image ]; then
           echo "✅ Kernel Image built!"
           ls -la out/arch/arm64/boot/Image
+          KERNEL_IMAGE="Image"
         else
           echo "❌ Kernel build failed!"
-          echo "=== Last 100 lines of build log ==="
-          tail -100 build.log
+          echo ""
+          echo "=== Last 200 lines of build log ==="
+          tail -200 build.log
+          echo ""
+          echo "=== Searching for errors ==="
+          grep -i "error:" build.log | tail -50
           exit 1
         fi
         
-    - name: Create boot.img
+        echo "KERNEL_IMAGE=$KERNEL_IMAGE" >> $GITHUB_ENV
+        
+        # Verify KernelSU was compiled in
+        echo "=== Checking if KernelSU was compiled ==="
+        if grep -q "KernelSU" out/.config 2>/dev/null; then
+          grep "CONFIG_KSU" out/.config
+        fi
+        
+    - name: Create flashable zip with AnyKernel3
       run: |
         cd kernel
         
@@ -211,13 +353,13 @@ jobs:
         # Clean unnecessary files
         rm -rf .git .github modules patch ramdisk
         
-        # Configure for guacamoleb
+        # Configure for OnePlus 7 (guacamoleb)
         cat > anykernel.sh << 'AKEOF'
 # AnyKernel3 Ramdisk Mod Script
 # osm0sis @ xda-developers
 
 properties() { '
-kernel.string=OnePlus7-KSU-Kprobes-Kernel
+kernel.string=OnePlus7-KSU-Kprobes by GitHub Actions
 do.devicecheck=1
 do.modules=0
 do.systemless=1
@@ -249,33 +391,46 @@ write_boot;
 AKEOF
 
         # Copy kernel image
-        if [ -f ../out/arch/arm64/boot/Image.gz-dtb ]; then
-          cp ../out/arch/arm64/boot/Image.gz-dtb Image.gz-dtb
-        elif [ -f ../out/arch/arm64/boot/Image.gz ]; then
-          cp ../out/arch/arm64/boot/Image.gz Image.gz
-        elif [ -f ../out/arch/arm64/boot/Image ]; then
-          cp ../out/arch/arm64/boot/Image Image
-        fi
+        cp ../out/arch/arm64/boot/${KERNEL_IMAGE} .
+        echo "✅ Copied ${KERNEL_IMAGE}"
         
-        # Copy DTB if separate
+        # Copy DTB files if they exist separately
         if [ -f ../out/arch/arm64/boot/dtb.img ]; then
           cp ../out/arch/arm64/boot/dtb.img dtb
+          echo "✅ Copied dtb.img"
         fi
+        
         if [ -f ../out/arch/arm64/boot/dtbo.img ]; then
-          cp ../out/arch/arm64/boot/dtbo.img dtbo.img
+          cp ../out/arch/arm64/boot/dtbo.img .
+          echo "✅ Copied dtbo.img"
         fi
+        
+        # Look for DTBs in dts folder
+        if ls ../out/arch/arm64/boot/dts/qcom/*.dtb 1> /dev/null 2>&1; then
+          cat ../out/arch/arm64/boot/dts/qcom/sm8150*.dtb > dtb 2>/dev/null || true
+          echo "✅ Concatenated DTBs"
+        fi
+        
+        # Show what we're packaging
+        echo "=== AnyKernel3 contents ==="
+        ls -la
         
         # Create flashable zip
-        zip -r9 ../OnePlus7-KSU-Kprobes-Kernel-$(date +%Y%m%d).zip * -x '*.git*'
+        ZIPNAME="OnePlus7-KSU-Kprobes-$(date +%Y%m%d-%H%M).zip"
+        zip -r9 "../${ZIPNAME}" * -x '*.git*'
         
-        echo "✅ Flashable zip created!"
-        ls -la ../OnePlus7-KSU-Kprobes-Kernel-*.zip
+        echo "✅ Flashable zip created: ${ZIPNAME}"
+        ls -la "../${ZIPNAME}"
+        
+        # Save zip name for upload
+        echo "ZIPNAME=${ZIPNAME}" >> $GITHUB_ENV
         
     - name: Upload kernel zip
       uses: actions/upload-artifact@v4
       with:
         name: OnePlus7-KSU-Kprobes-Kernel
-        path: kernel/OnePlus7-KSU-Kprobes-Kernel-*.zip
+        path: kernel/OnePlus7-KSU-Kprobes-*.zip
+        retention-days: 30
         
     - name: Upload build log
       uses: actions/upload-artifact@v4
@@ -283,3 +438,12 @@ AKEOF
       with:
         name: build-log
         path: kernel/build.log
+        retention-days: 7
+        
+    - name: Upload kernel config
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: kernel-config
+        path: kernel/out/.config
+        retention-days: 7
